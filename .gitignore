@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+# Datos sensibles: nunca subir cartas, listas ni la base de datos
+*.db
+*.pdf
+*.xlsx
+pdfs_divididos/
+reportes/
