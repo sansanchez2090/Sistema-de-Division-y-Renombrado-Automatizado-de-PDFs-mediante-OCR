@@ -2,15 +2,6 @@
 procesador.py
 Lógica del negocio: lectura de Excel, base de datos SQLite, OCR, cruce de
 nombres, renombrado de PDFs, verificación, reporte de control y reinicio.
-
-IMPORTANTE para la futura interfaz:
-  - Ninguna función hace input(). Todas reciben parámetros.
-  - Todas reciben `log` (por defecto print). Con la interfaz solo cambiamos
-    `log` por una función que ponga el mensaje en una cola.
-  - procesar_lote()/procesar_carpeta() reciben `progreso` (callback) y
-    `detener` (threading.Event).
-  - Cada función abre su propia conexión SQLite: es seguro usarlas desde un
-    hilo distinto al de la ventana.
 """
 
 import hashlib
@@ -24,7 +15,8 @@ from datetime import datetime
 import pandas as pd
 import pytesseract
 from openpyxl.styles import Font
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
+from pdf2image.exceptions import PDFInfoNotInstalledError
 from pypdf import PdfReader, PdfWriter
 from rapidfuzz import fuzz
 
@@ -45,6 +37,7 @@ UMBRAL_ZONA = 90  # Puntaje mínimo buscando en la zona del destinatario
 UMBRAL_PAGINA = 96  # Puntaje mínimo buscando en todo el texto leído (más estricto)
 DIF_AMBIGUO = 3  # Si los 2 mejores difieren menos de esto -> REVISAR
 MIN_CARACTERES_OCR = 20  # Si el OCR lee menos que esto, la página se considera vacía
+MAX_ERRORES_SEGUIDOS = 5  # Tras N páginas con ERROR seguidas, el lote se detiene
 FACTOR_LONGITUD = (
     0.8  # La zona debe medir al menos 80% del nombre para poder compararlo
 )
@@ -553,6 +546,42 @@ def _ocr_pagina(pdf_path, num_pagina):
     return pytesseract.image_to_string(zona_sup, lang="spa")
 
 
+def verificar_dependencias(pdf_path=None):
+    """
+    Revisa que Tesseract (con idioma español) y Poppler funcionen.
+    Devuelve una lista de problemas en lenguaje claro (vacía si todo está bien).
+    Para revisar Poppler hay que pasar la ruta de algún PDF.
+    """
+    problemas = []
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:
+        problemas.append(
+            "No se encontró Tesseract OCR. Verifica que esté instalado y que el programa"
+            " conozca su ubicación."
+        )
+    else:
+        try:
+            if "spa" not in pytesseract.get_languages(config=""):
+                problemas.append(
+                    "Tesseract está instalado, pero le falta el idioma español (spa)."
+                )
+        except Exception:
+            pass
+
+    if pdf_path:
+        try:
+            pdfinfo_from_path(pdf_path, poppler_path=RUTA_POPPLER)
+        except PDFInfoNotInstalledError:
+            problemas.append(
+                "No se encontró Poppler. Verifica que esté instalado y que el programa"
+                " conozca su ubicación."
+            )
+        except Exception:
+            pass  # PDF dañado u otro problema: lo reporta el procesamiento
+    return problemas
+
+
 def procesar_lote(
     pdf_path,
     ruta_db=RUTA_DB,
@@ -649,6 +678,7 @@ def procesar_lote(
             "ERROR": 0,
         }
         cancelado = False
+        errores_seguidos = 0
 
         for num in range(1, total + 1):
             if detener is not None and detener.is_set():
@@ -703,6 +733,7 @@ def procesar_lote(
                 con.commit()  # <- guardado página por página
 
                 cont[estado_pag] += 1
+                errores_seguidos = 0
                 prefijo = f"[{num}/{total}]"
                 if estado_pag == "OK":
                     log(f"{prefijo} OK ({puntaje:.0f}%) -> {archivo}")
@@ -734,6 +765,15 @@ def procesar_lote(
                 con.commit()
                 cont["ERROR"] += 1
                 log(f"[{num}/{total}] ERROR procesando página: {e}")
+                errores_seguidos += 1
+                if errores_seguidos >= MAX_ERRORES_SEGUIDOS:
+                    log(
+                        f"\n[DETENIDO] {MAX_ERRORES_SEGUIDOS} errores seguidos. Revisa que Tesseract"
+                        " y Poppler estén instalados y que el PDF sea legible. Al corregirlo, vuelve"
+                        " a procesar el mismo PDF: continuará donde quedó."
+                    )
+                    cancelado = True
+                    break
 
             if progreso is not None:
                 progreso(num, total)
